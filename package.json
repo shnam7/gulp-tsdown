@@ -1,0 +1,80 @@
+{
+  "name": "gulp-tsdown",
+  "version": "0.9.0",
+  "description": "Blazing fast Gulp plugin for TypeScript compilation and bundling using tsdown in memory.",
+  "module": "./src/index.ts",
+  "type": "module",
+  "exports": {
+    ".": {
+      "types": {
+        "import": "./dist/index.d.mts",
+        "require": "./dist/index.d.cts",
+        "default": "./dist/index.d.mts"
+      },
+      "import": {
+        "types": "./dist/index.d.mts",
+        "default": "./dist/index.mjs"
+      },
+      "require": {
+        "types": "./dist/index.d.cts",
+        "default": "./dist/index.cjs"
+      },
+      "default": "./dist/index.mjs"
+    }
+  },
+  "files": [
+    "dist/*"
+  ],
+  "scripts": {
+    "build": "tsdown src/index.ts --format cjs,esm --dts",
+    "lint": "bun --parallel lint:*",
+    "lint:ts": "biome check",
+    "lint:ts:types": "tsc --noEmit",
+    "test": "vitest run --coverage",
+    "test:watch": "vitest watch --coverage",
+    "clean": "rimraf ./dist ./coverage",
+    "rebuild": "bun run --sequential clean build",
+    "prepublishOnly": "bun run build",
+    "prepare-to-commit": "bun run --sequential rebuild lint test",
+    "npm-dry-run": "npm publish --dry-run"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/shnam7/gulp-tsdown.git"
+  },
+  "homepage": "https://github.com/shnam7/gulp-tsdown#readme",
+  "bugs": {
+    "url": "https://github.com/shnam7/gulp-tsdown/issues"
+  },
+  "author": "Robin Nam (https://github.com/shnam7)",
+  "license": "MIT",
+  "publishConfig": {
+    "access": "public"
+  },
+  "keywords": [
+    "gulp",
+    "plugin",
+    "tsdown"
+  ],
+  "dependencies": {
+    "plugin-error": "^2.0.1",
+    "streamx": "^2.28.0",
+    "unconfig": "^7.5.0",
+    "tsdown": "^0.22.12",
+    "vinyl": "^3.0.1"
+  },
+  "devDependencies": {
+    "@biomejs/biome": "^2.5.4",
+    "@types/bun": "^1.3.14",
+    "@types/node": "^26.1.1",
+    "@types/vinyl": "^2.0.12",
+    "@vitest/coverage-v8": "^4.1.10",
+    "rimraf": "^6.1.3",
+    "typescript": "7.0.2",
+    "vitest": "^4.1.10"
+  },
+  "peerDependencies": {
+    "gulp": "^5.0.1"
+  },
+  "packageManager": "bun@1.3.14"
+}
