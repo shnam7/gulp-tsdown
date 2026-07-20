@@ -1,7 +1,7 @@
 {
   "name": "gulp-tsdown",
   "version": "0.9.0",
-  "description": "Blazing fast Gulp plugin for TypeScript compilation and bundling using tsdown in memory.",
+  "description": "Gulp plugin for TypeScript compilation and bundling using tsdown in-memory.",
   "module": "./src/index.ts",
   "type": "module",
   "exports": {

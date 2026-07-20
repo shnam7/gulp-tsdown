@@ -1,368 +1,563 @@
-import path from "node:path";
-import { Readable } from "streamx";
-import { build, type TsdownBundle } from "tsdown";
-import { loadConfig } from "unconfig";
+import { Readable } from "node:stream";
 import Vinyl from "vinyl";
 import { beforeEach, describe, expect, it, vi } from "vitest";
-import gulpTsdown from "../src/index.js";
 
-// Mock external dependencies to isolate plugin behavior
-vi.mock("tsdown", () => ({
-  build: vi.fn(),
-}));
-
+// --- Mocks -----------------------------------------------------------------
 vi.mock("unconfig", () => ({
   loadConfig: vi.fn(),
 }));
 
-// Extend Error interface to support Gulp ecosystem specific property
-interface GulpPluginError extends Error {
-  plugin?: string;
+vi.mock("tsdown", () => ({
+  build: vi.fn(),
+}));
+
+import { build, type UserConfig } from "tsdown";
+import { loadConfig } from "unconfig";
+import gulpTsdown from "../src/index";
+
+const mockedLoadConfig = vi.mocked(loadConfig);
+const mockedBuild = vi.mocked(build);
+
+type Bundle = Record<string, { code?: string; source?: string; map?: unknown } | undefined>;
+
+// function getBuildConfig(index = 0): Partial<UserConfig> {
+//   return (mockedBuild.mock.calls[index]?.[0] as Partial<UserConfig>) || {};
+// }
+
+/** Finds the in-memory interceptor plugin passed to `build()`. */
+function findMemoryPlugin(config: Parameters<typeof build>[0]): {
+  generateBundle: (o: unknown, b: Bundle) => void;
+} {
+  const plugins = Array.isArray(config?.plugins)
+    ? config.plugins
+    : config?.plugins
+      ? [config.plugins]
+      : [];
+
+  const plugin = plugins.find((p) => {
+    if (p && typeof p === "object" && "name" in p) {
+      return p.name === "gulp-tsdown-memory-interceptor";
+    }
+    return false;
+  });
+  if (!plugin) throw new Error("memory interceptor plugin not found in config.plugins");
+  return plugin as unknown as { generateBundle: (o: unknown, b: Bundle) => void };
 }
 
-describe("gulpTsdown Plugin - 100% Coverage Test Suite", () => {
-  beforeEach(() => {
-    vi.clearAllMocks();
+// function findMemoryPlugin(config: any): { generateBundle: (o: unknown, b: Bundle) => void } {
+//   const plugin = config.plugins.find((p: any) => p?.name === "gulp-tsdown-memory-interceptor");
+//   if (!plugin) throw new Error("memory interceptor plugin not found in config.plugins");
+//   return plugin;
+// }
+
+/** Runs the plugin end-to-end: writes input files, ends the stream, collects output Vinyl files. */
+function run(
+  pluginOptions: Parameters<typeof gulpTsdown>[0],
+  inputFiles: Vinyl[] = [],
+): Promise<{ files: Vinyl[]; buildConfig: Partial<UserConfig>; error: Error | null }> {
+  return new Promise((resolve, reject) => {
+    const stream = gulpTsdown(pluginOptions);
+    const outFiles: Vinyl[] = [];
+    let settled = false;
+
+    stream.on("data", (chunk: unknown) => outFiles.push(chunk as Vinyl));
+    stream.on("error", (err: Error) => {
+      if (settled) return;
+      settled = true;
+      resolve({
+        files: outFiles,
+        buildConfig: mockedBuild.mock.calls.at(-1)?.[0] as Partial<UserConfig>,
+        error: err,
+      });
+    });
+    stream.on("end", () => {
+      if (settled) return;
+      settled = true;
+      resolve({
+        files: outFiles,
+        buildConfig: mockedBuild.mock.calls.at(-1)?.[0] as Partial<UserConfig>,
+        error: null,
+      });
+    });
+
+    for (const file of inputFiles) stream.write(file);
+    stream.end(null);
+
+    setTimeout(() => {
+      if (!settled) reject(new Error("stream did not settle in time"));
+    }, 2000);
+  });
+}
+
+function vinylFile(filePath: string, contents: string | null = ""): Vinyl {
+  return new Vinyl({
+    cwd: process.cwd(),
+    path: filePath,
+    contents: contents === null ? null : Buffer.from(contents),
+  });
+}
+
+beforeEach(() => {
+  vi.clearAllMocks();
+  mockedLoadConfig.mockResolvedValue({ config: {}, sources: [] });
+  mockedBuild.mockResolvedValue([]);
+});
+
+describe("transform", () => {
+  it("passes null files through untouched", async () => {
+    const nullFile = vinylFile("a.ts", null);
+    const { files, error } = await run({ entry: ["x.ts"] }, [nullFile]);
+    expect(error).toBeNull();
+    // the null file itself is forwarded (isNull short-circuit), no bundle output requested
+    expect(files).toContain(nullFile);
   });
 
-  it("should collect file paths, trigger generateBundle hook, and stream virtual Vinyl objects with sourcemaps", async () => {
-    // Setup mock values for successful memory compilation pipeline
-    vi.mocked(loadConfig).mockResolvedValue({ config: {}, sources: [] });
-
-    // Simulate tsdown build execution and grab the injected memory interceptor plugin
-    vi.mocked(build).mockImplementation(async (config) => {
-      const cfg = config as Record<string, unknown>;
-      const plugins = cfg.plugins as Array<Record<string, unknown>>;
-      const memoryPlugin = plugins.find((p) => p.name === "gulp-tsdown-memory-interceptor");
-
-      if (memoryPlugin && typeof memoryPlugin.generateBundle === "function") {
-        // Construct mock bundle assets to satisfy both object-typed maps and string-typed maps coverage
-        const mockBundle: Record<string, unknown> = {
-          "index.js": {
-            type: "chunk",
-            code: 'console.log("hello");',
-            map: { version: 3, file: "index.js", sources: [], names: [], mappings: "" }, // Object map
-          },
-          "utils.js": {
-            type: "chunk",
-            code: 'console.log("utils");',
-            map: '{"version":3,"mappings":""}', // String map
-          },
-          "ignored.txt": { type: "asset", source: "text" }, // Covers non-string asset branches
-        };
-
-        // Execute the generateBundle hook within tsdown mock
-        memoryPlugin.generateBundle({}, mockBundle);
-      }
-      return [] as TsdownBundle[];
+  it("errors on streaming files", async () => {
+    const streamFile = new Vinyl({
+      cwd: process.cwd(),
+      path: "a.ts",
+      contents: new Readable({ read() {} }),
     });
-
-    // Enable sourcemap via option to trigger map-processing logic block inside the plugin
-    const stream = gulpTsdown({ outDir: "./dist", sourcemap: true });
-
-    const file1 = new Vinyl({
-      path: "/project/src/index.ts",
-      contents: Buffer.from("console.log(1)"),
-    });
-    const file2 = new Vinyl({
-      path: "/project/src/utils.ts",
-      contents: Buffer.from("console.log(2)"),
-    });
-
-    const outputFiles: Vinyl[] = [];
-
-    await new Promise<void>((resolve, reject) => {
-      // Receive as 'unknown' to comply with streamx event signatures, then safe-cast inside
-      stream.on("data", (chunk: unknown) => {
-        outputFiles.push(chunk as Vinyl);
-      });
-
-      stream.on("finish", () => {
-        try {
-          expect(loadConfig).toHaveBeenCalled();
-          expect(build).toHaveBeenCalledWith(
-            expect.objectContaining({
-              entry: ["/project/src/index.ts", "/project/src/utils.ts"],
-              write: false,
-              clean: false,
-              sourcemap: true,
-            }),
-          );
-
-          // Verify that 2 main JS files and 2 sourcemap files were successfully generated
-          expect(outputFiles).toHaveLength(4);
-
-          const paths = outputFiles.map((f) => f.path);
-          const expectedJsPath = path.resolve(process.cwd(), "dist", "index.js");
-          const expectedMapPath = path.resolve(process.cwd(), "dist", "index.js.map");
-          const expectedUtilsJsPath = path.resolve(process.cwd(), "dist", "utils.js");
-          const expectedUtilsMapPath = path.resolve(process.cwd(), "dist", "utils.js.map");
-
-          expect(paths).toContain(expectedJsPath);
-          expect(paths).toContain(expectedMapPath);
-          expect(paths).toContain(expectedUtilsJsPath);
-          expect(paths).toContain(expectedUtilsMapPath);
-          resolve();
-        } catch (e) {
-          reject(e as Error);
-        }
-      });
-      stream.on("error", (err: Error) => reject(err));
-
-      stream.write(file1);
-      stream.write(file2);
-      stream.end(() => {});
-    });
+    const { error } = await run({ entry: ["x.ts"] }, [streamFile]);
+    expect(error).toBeInstanceOf(Error);
+    expect(error?.message).toMatch(/Streaming is not supported/);
   });
 
-  it("should safely skip map generation when sourcemap option is set to false", async () => {
-    vi.mocked(loadConfig).mockResolvedValue({ config: { sourcemap: false }, sources: [] });
+  it("collects buffer file paths to use as entry when no entry is configured", async () => {
+    const file = vinylFile("/proj/src/one.ts", "export {}");
+    await run({}, [file]);
+    expect(mockedBuild).toHaveBeenCalledTimes(1);
 
-    vi.mocked(build).mockImplementation(async (config) => {
-      const cfg = config as Record<string, unknown>;
-      const plugins = cfg.plugins as Array<Record<string, unknown>>;
-      const memoryPlugin = plugins.find((p) => p.name === "gulp-tsdown-memory-interceptor");
-
-      if (memoryPlugin && typeof memoryPlugin.generateBundle === "function") {
-        const mockBundle: Record<string, unknown> = {
-          "index.js": {
-            type: "chunk",
-            code: 'console.log("no-map");',
-            map: { version: 3, file: "index.js" }, // map metadata exists but should be ignored
-          },
-        };
-        memoryPlugin.generateBundle({}, mockBundle);
-      }
-      return [] as TsdownBundle[];
-    });
-
-    const stream = gulpTsdown({ outDir: "./dist", sourcemap: false });
-    const file = new Vinyl({
-      path: "/project/src/index.ts",
-      contents: Buffer.from("console.log(1)"),
-    });
-    const outputFiles: Vinyl[] = [];
-
-    await new Promise<void>((resolve, reject) => {
-      stream.on("data", (chunk: unknown) => {
-        outputFiles.push(chunk as Vinyl);
-      });
-
-      stream.on("finish", () => {
-        try {
-          // JS chunk should be emitted, but map file must be skipped
-          expect(outputFiles).toHaveLength(1);
-          expect(outputFiles[0]?.path).toBe(path.resolve(process.cwd(), "dist", "index.js"));
-          resolve();
-        } catch (e) {
-          reject(e as Error);
-        }
-      });
-      stream.on("error", (err: Error) => reject(err));
-
-      stream.write(file);
-      stream.end(() => {});
-    });
-  });
-
-  it("should process asset types correctly if type parameter equals chunk or code is provided", async () => {
-    vi.mocked(loadConfig).mockResolvedValue({ config: {}, sources: [] });
-
-    vi.mocked(build).mockImplementation(async (config) => {
-      const cfg = config as Record<string, unknown>;
-      const plugins = cfg.plugins as Array<Record<string, unknown>>;
-      const memoryPlugin = plugins.find((p) => p.name === "gulp-tsdown-memory-interceptor");
-
-      if (memoryPlugin && typeof memoryPlugin.generateBundle === "function") {
-        const mockBundle: Record<string, unknown> = {
-          // Case where type !== "chunk" but typeof code === "string" (covers the right side of the || operator)
-          "legacy-asset.js": {
-            type: "asset",
-            code: 'console.log("legacy");',
-          },
-        };
-        memoryPlugin.generateBundle({}, mockBundle);
-      }
-      return [] as TsdownBundle[];
-    });
-
-    const stream = gulpTsdown({ outDir: "./dist" });
-    const file = new Vinyl({
-      path: "/project/src/index.ts",
-      contents: Buffer.from("console.log(1)"),
-    });
-    const outputFiles: Vinyl[] = [];
-
-    await new Promise<void>((resolve, reject) => {
-      stream.on("data", (chunk: unknown) => {
-        outputFiles.push(chunk as Vinyl);
-      });
-
-      stream.on("finish", () => {
-        try {
-          expect(outputFiles).toHaveLength(1);
-          expect(outputFiles[0]?.path).toBe(path.resolve(process.cwd(), "dist", "legacy-asset.js"));
-          resolve();
-        } catch (e) {
-          reject(e as Error);
-        }
-      });
-      stream.on("error", (err: Error) => reject(err));
-
-      stream.write(file);
-      stream.end(() => {});
-    });
-  });
-
-  it("should merge configuration from tsdown.config file with correct entry file resolution priority", async () => {
-    vi.mocked(loadConfig).mockResolvedValue({
-      config: {
-        entry: ["/project/src/config-entry.ts"],
-        outDir: "./config-out",
-        plugins: [{ name: "dummy" }],
-      },
-      sources: [],
-    });
-    vi.mocked(build).mockResolvedValue([] as TsdownBundle[]);
-
-    const stream = gulpTsdown({ format: "cjs", plugins: [{ name: "option-dummy" }] });
-    const file = new Vinyl({ path: "/project/src/ignored.ts", contents: Buffer.from("") });
-
-    await new Promise<void>((resolve, reject) => {
-      stream.on("finish", () => {
-        try {
-          expect(build).toHaveBeenCalledWith(
-            expect.objectContaining({
-              entry: ["/project/src/config-entry.ts"],
-              format: "cjs",
-            }),
-          );
-          resolve();
-        } catch (e) {
-          reject(e as Error);
-        }
-      });
-      stream.on("error", (err: Error) => reject(err));
-
-      stream.write(file);
-      stream.end(() => {});
-    });
-  });
-
-  it("should emit a PluginError if no entry files are provided or resolved anywhere", async () => {
-    vi.mocked(loadConfig).mockResolvedValue({ config: {}, sources: [] });
-
-    const stream = gulpTsdown();
-
-    await new Promise<void>((resolve, reject) => {
-      stream.on("error", (err: Error) => {
-        try {
-          const pluginError = err as GulpPluginError;
-          expect(pluginError.plugin).toBe("gulp-tsdown");
-          expect(pluginError.message).toContain("No entry files found");
-          resolve();
-        } catch (e) {
-          reject(e as Error);
-        }
-      });
-      stream.on("finish", () => reject(new Error("Should have failed")));
-
-      stream.end(() => {});
-    });
-  });
-
-  it("should emit a PluginError if a streaming Vinyl file is passed", async () => {
-    const stream = gulpTsdown();
-
-    await new Promise<void>((resolve, reject) => {
-      stream.on("error", (err: Error) => {
-        try {
-          const pluginError = err as GulpPluginError;
-          expect(pluginError.plugin).toBe("gulp-tsdown");
-          expect(pluginError.message).toBe("Streaming is not supported.");
-          resolve();
-        } catch (e) {
-          reject(e as Error);
-        }
-      });
-      const file = new Vinyl({
-        path: "/project/src/stream.ts",
-        contents: new Readable({ read() {} }) as unknown as NodeJS.ReadableStream,
-      });
-      stream.write(file);
-      stream.end(() => {});
-    });
-  });
-  it("should safely bypass null files and continue stream processing without adding them to entry metadata", async () => {
-    vi.mocked(loadConfig).mockResolvedValue({ config: {}, sources: [] });
-    vi.mocked(build).mockResolvedValue([] as TsdownBundle[]);
-    const stream = gulpTsdown({ outDir: "./out" });
-    const nullFile = new Vinyl({ path: "/project/src/empty-folder", contents: null });
-    const realFile = new Vinyl({
-      path: "/project/src/main.ts",
-      contents: Buffer.from("const a = 1;"),
-    });
-    await new Promise<void>((resolve, reject) => {
-      stream.on("data", (chunk: unknown) => {
-        const file = chunk as Vinyl;
-        expect(file.contents).toBeNull();
-      });
-      stream.on("finish", () => {
-        try {
-          expect(build).toHaveBeenCalledWith(
-            expect.objectContaining({ entry: ["/project/src/main.ts"], outDir: "./out" }),
-          );
-          resolve();
-        } catch (e) {
-          reject(e as Error);
-        }
-      });
-      stream.on("error", (err: Error) => reject(err));
-      stream.write(nullFile);
-      stream.write(realFile);
-      stream.end(() => {});
-    });
-  });
-  it("should catch and propagate a standard Error object if tsdown build fails natively", async () => {
-    vi.mocked(loadConfig).mockResolvedValue({ config: {}, sources: [] });
-    vi.mocked(build).mockRejectedValue(new Error("Tsdown internal compiler failure"));
-    const stream = gulpTsdown();
-    const file = new Vinyl({ path: "/project/src/main.ts", contents: Buffer.from("") });
-    await new Promise<void>((resolve, reject) => {
-      stream.on("error", (err: Error) => {
-        try {
-          const pluginError = err as GulpPluginError;
-          expect(pluginError.plugin).toBe("gulp-tsdown");
-          expect(pluginError.message).toBe("Tsdown internal compiler failure");
-          resolve();
-        } catch (e) {
-          reject(e as Error);
-        }
-      });
-      stream.on("finish", () => reject(new Error("Should have failed")));
-      stream.write(file);
-      stream.end(() => {});
-    });
-  });
-  it("should safely wrap non-error catches into a formal Error object structure", async () => {
-    vi.mocked(loadConfig).mockResolvedValue({ config: {}, sources: [] });
-    vi.mocked(build).mockRejectedValue("Raw string runtime panic exception");
-    const stream = gulpTsdown();
-    const file = new Vinyl({ path: "/project/src/main.ts", contents: Buffer.from("") });
-    await new Promise<void>((resolve, reject) => {
-      stream.on("error", (err: Error) => {
-        try {
-          const pluginError = err as GulpPluginError;
-          expect(pluginError.plugin).toBe("gulp-tsdown");
-          expect(pluginError.message).toBe("Raw string runtime panic exception");
-          resolve();
-        } catch (e) {
-          reject(e as Error);
-        }
-      });
-      stream.on("finish", () => reject(new Error("Should have failed")));
-      stream.write(file);
-      stream.end(() => {});
-    });
+    const configArg = mockedBuild.mock.calls[0]?.[0] as Partial<UserConfig> | undefined;
+    expect(configArg?.entry).toEqual(["/proj/src/one.ts"]);
   });
 });
+
+describe("entry resolution", () => {
+  it("errors when no entry can be resolved from options, config, or files", async () => {
+    const { error } = await run({});
+    expect(error).toBeInstanceOf(Error);
+    expect(error?.message).toMatch(/No entry files found/);
+    expect(mockedBuild).not.toHaveBeenCalled();
+  });
+
+  it("errors when resolved entry is an empty array", async () => {
+    const { error } = await run({ entry: [] });
+    expect(error?.message).toMatch(/No entry files found/);
+  });
+
+  it("prefers pluginOptions.entry over config entry and collected files", async () => {
+    mockedLoadConfig.mockResolvedValue({ config: { entry: ["config.ts"] }, sources: [] });
+    const file = vinylFile("/proj/gulp-collected.ts", "");
+    await run({ entry: ["option.ts"] }, [file]);
+
+    const configArg = mockedBuild.mock.calls[0]?.[0] as Partial<UserConfig> | undefined;
+    expect(configArg?.entry).toEqual(["option.ts"]);
+  });
+
+  it("falls back to tsdown.config entry when pluginOptions has none", async () => {
+    mockedLoadConfig.mockResolvedValue({ config: { entry: ["config.ts"] }, sources: [] });
+    await run({});
+    const configArg = mockedBuild.mock.calls[0]?.[0] as Partial<UserConfig> | undefined;
+    expect(configArg?.entry).toEqual(["config.ts"]);
+  });
+});
+
+describe("outDir resolution", () => {
+  it("defaults to dist", async () => {
+    const { files } = await withBundle(
+      { entry: ["x.ts"] },
+      { "index.js": { code: "console.log(1)" } },
+    );
+    expect(files[0]?.path).toContain(`dist${require("node:path").sep}index.js`);
+  });
+
+  it("prefers pluginOptions.outDir over config outDir", async () => {
+    mockedLoadConfig.mockResolvedValue({ config: { outDir: "config-out" }, sources: [] });
+    const { files } = await withBundle(
+      { entry: ["x.ts"], outDir: "option-out" },
+      { "index.js": { code: "x" } },
+    );
+    expect(files[0]?.path).toContain(`option-out${require("node:path").sep}index.js`);
+  });
+
+  it("falls back to config outDir when option outDir is absent", async () => {
+    mockedLoadConfig.mockResolvedValue({ config: { outDir: "config-out" }, sources: [] });
+    const { files } = await withBundle({ entry: ["x.ts"] }, { "index.js": { code: "x" } });
+    expect(files[0]?.path).toContain(`config-out${require("node:path").sep}index.js`);
+  });
+});
+
+describe("plugins merging", () => {
+  it("appends the memory interceptor after existing config and option plugins", async () => {
+    const configPlugin = { name: "config-plugin" };
+    const optionPlugin = { name: "option-plugin" };
+    mockedLoadConfig.mockResolvedValue({ config: { plugins: [configPlugin] }, sources: [] });
+    await run({ entry: ["x.ts"], plugins: [optionPlugin] });
+    const configArg = mockedBuild.mock.calls[0]?.[0] as Partial<UserConfig> | undefined;
+    const plugins = Array.isArray(configArg?.plugins)
+      ? configArg.plugins
+      : configArg?.plugins
+        ? [configArg.plugins]
+        : [];
+
+    const pluginNames = plugins.map((p) => {
+      return p && typeof p === "object" && "name" in p ? p.name : "";
+    });
+
+    // const pluginNames = mockedBuild.mock.calls[0][0].plugins;
+    expect(pluginNames).toEqual([
+      "config-plugin",
+      "option-plugin",
+      "gulp-tsdown-memory-interceptor",
+    ]);
+  });
+
+  it("handles absence of config/option plugins gracefully", async () => {
+    await run({ entry: ["x.ts"] });
+
+    const configArg = mockedBuild.mock.calls[0]?.[0] as Partial<UserConfig> | undefined;
+    const plugins = Array.isArray(configArg?.plugins)
+      ? configArg.plugins
+      : configArg?.plugins
+        ? [configArg.plugins]
+        : [];
+
+    expect(plugins).toHaveLength(1);
+    const firstPlugin = plugins[0];
+    const pluginName =
+      firstPlugin && typeof firstPlugin === "object" && "name" in firstPlugin
+        ? firstPlugin.name
+        : "";
+
+    expect(pluginName).toBe("gulp-tsdown-memory-interceptor");
+  });
+});
+
+describe("dts config merging", () => {
+  it("leaves dts undefined when neither config nor options set it", async () => {
+    await run({ entry: ["x.ts"] });
+    const configArg = mockedBuild.mock.calls[0] as Partial<UserConfig> | undefined;
+    expect(configArg?.dts).toBeUndefined();
+  });
+
+  it("injects the memory interceptor into an object-form dts config, preserving existing plugins", async () => {
+    const existingDtsPlugin = { name: "existing-dts-plugin" };
+    await run({ entry: ["x.ts"], dts: { plugins: [existingDtsPlugin] } } as Partial<UserConfig>);
+
+    const configArg = mockedBuild.mock.calls?.[0]?.[0] as Partial<UserConfig> | undefined;
+    const dts = configArg?.dts;
+    const dtsPlugins =
+      dts && typeof dts === "object" && "plugins" in dts && Array.isArray(dts.plugins)
+        ? dts.plugins
+        : [];
+
+    const pluginNames = dtsPlugins.map((p) => {
+      return p && typeof p === "object" && "name" in p ? p.name : "";
+    });
+
+    expect(pluginNames).toEqual(["existing-dts-plugin", "gulp-tsdown-memory-interceptor"]);
+  });
+
+  it("merges config-level dts object with option-level dts object", async () => {
+    mockedLoadConfig.mockResolvedValue({
+      config: { dts: { resolve: true } },
+      sources: [],
+    });
+    await run({ entry: ["x.ts"], dts: { sourcemap: true } });
+
+    const configArg = mockedBuild.mock.calls[0]?.[0];
+    const rawDts =
+      configArg && typeof configArg === "object" && "dts" in configArg ? configArg.dts : null;
+    if (!rawDts || typeof rawDts !== "object") {
+      throw new Error("dts option is missing or not an object");
+    }
+
+    const dts = rawDts as { resolve?: boolean; sourcemap?: boolean; plugins?: unknown[] };
+    expect(dts.resolve).toBe(true);
+    expect(dts.sourcemap).toBe(true);
+    expect(dts.plugins).toEqual([
+      expect.objectContaining({ name: "gulp-tsdown-memory-interceptor" }),
+    ]);
+  });
+
+  it("still injects the interceptor when dts is simply `true`", async () => {
+    await run({ entry: ["x.ts"], dts: true });
+    const configArg = mockedBuild.mock.calls[0]?.[0] as Partial<UserConfig> | undefined;
+    const dts = configArg?.dts;
+    const dtsPlugins = dts && typeof dts === "object" && "plugins" in dts ? dts.plugins : undefined;
+
+    expect(dtsPlugins).toEqual([
+      expect.objectContaining({ name: "gulp-tsdown-memory-interceptor" }),
+    ]);
+  });
+});
+
+describe("generateBundle - standard output", () => {
+  it("emits a file whose content is under `code`", async () => {
+    const { files } = await withBundle(
+      { entry: ["x.ts"] },
+      {
+        "index.js": { code: "console.log('hi')" },
+      },
+    );
+    expect(files).toHaveLength(1);
+    expect(files[0]?.contents?.toString()).toBe("console.log('hi')");
+    expect(files[0]?.path.endsWith("index.js")).toBe(true);
+  });
+
+  it("emits a file whose content is under `source` (declaration output)", async () => {
+    const { files } = await withBundle(
+      { entry: ["x.ts"] },
+      {
+        "index.d.ts": { source: "export declare const x: number;" },
+      },
+    );
+    expect(files).toHaveLength(1);
+    expect(files[0]?.contents?.toString()).toBe("export declare const x: number;");
+  });
+
+  it("skips bundle entries with neither `code` nor `source`", async () => {
+    const { files } = await withBundle({ entry: ["x.ts"] }, { "asset.bin": { map: undefined } });
+    expect(files).toHaveLength(0);
+  });
+
+  it("skips falsy bundle entries", async () => {
+    const { files } = await withBundleRaw({ entry: ["x.ts"] }, { "ghost.js": undefined });
+    expect(files).toHaveLength(0);
+  });
+
+  it("does not emit the same file name twice", async () => {
+    const { files } = await withGeneratedBundles({ entry: ["x.ts"] }, [
+      { "index.js": { code: "a" } },
+      { "index.js": { code: "a" } },
+    ]);
+    expect(files).toHaveLength(1);
+  });
+});
+
+describe("generateBundle - .d.cts forking", () => {
+  it("forks .d.cts from .d.ts when cjs format + fixedExtension are both on", async () => {
+    const { files } = await withBundle(
+      { entry: ["x.ts"], format: ["esm", "cjs"], fixedExtension: true },
+      { "index.d.ts": { source: "export type X = 1;" } },
+    );
+    const names = files.map((f) => f.path.split(require("node:path").sep).pop());
+    expect(names).toContain("index.d.ts");
+    expect(names).toContain("index.d.cts");
+  });
+
+  it("forks .d.cts from .d.mts (the fixedExtension esm naming) - regression for the reported bug", async () => {
+    const { files } = await withBundle(
+      { entry: ["x.ts"], format: ["esm", "cjs"], fixedExtension: true },
+      { "index.d.mts": { source: "export type X = 1;" } },
+    );
+    const names = files.map((f) => f.path.split(require("node:path").sep).pop());
+    expect(names).toContain("index.d.mts");
+    expect(names).toContain("index.d.cts");
+  });
+
+  it("rewrites relative .js/.mjs specifiers to .cjs inside the forked declaration", async () => {
+    const source = [
+      "import type { Foo } from './foo.mjs';",
+      "export { Bar } from '../bar.js';",
+    ].join("\n");
+    const { files } = await withBundle(
+      { entry: ["x.ts"], format: ["esm", "cjs"], fixedExtension: true },
+      { "index.d.mts": { source } },
+    );
+    const forked = files.find((f) => f.path.endsWith("index.d.cts"));
+    expect(forked?.contents?.toString()).toBe(
+      ["import type { Foo } from './foo.cjs';", "export { Bar } from '../bar.cjs';"].join("\n"),
+    );
+  });
+
+  it("does not fork when cjs is not one of the target formats", async () => {
+    const { files } = await withBundle(
+      { entry: ["x.ts"], format: ["esm"], fixedExtension: true },
+      { "index.d.mts": { source: "x" } },
+    );
+    expect(files.map((f) => f.path)).not.toEqual(
+      expect.arrayContaining([expect.stringContaining("d.cts")]),
+    );
+  });
+
+  it("does not fork when fixedExtension is off", async () => {
+    const { files } = await withBundle(
+      { entry: ["x.ts"], format: ["esm", "cjs"], fixedExtension: false },
+      { "index.d.ts": { source: "x" } },
+    );
+    expect(files.map((f) => f.path)).not.toEqual(
+      expect.arrayContaining([expect.stringContaining("d.cts")]),
+    );
+  });
+
+  it("reads format/fixedExtension from tsdown.config when options omit them", async () => {
+    mockedLoadConfig.mockResolvedValue({
+      config: { format: ["esm", "cjs"], fixedExtension: true },
+      sources: [],
+    });
+    const { files } = await withBundle(
+      { entry: ["x.ts"] },
+      {
+        "index.d.mts": { source: "x" },
+      },
+    );
+    expect(files.map((f) => f.path.split(require("node:path").sep).pop())).toContain("index.d.cts");
+  });
+
+  it("does not double-fork an already-forked .d.cts file", async () => {
+    const { files } = await withBundle(
+      { entry: ["x.ts"], format: ["esm", "cjs"], fixedExtension: true },
+      { "index.d.cts": { source: "x" } },
+    );
+    expect(files).toHaveLength(1);
+    expect(files[0]?.path.endsWith("index.d.cts")).toBe(true);
+  });
+
+  it("does not duplicate the forked file across repeated generateBundle calls (e.g. a second dts pass)", async () => {
+    const bundle = { "index.d.mts": { source: "x" } };
+    const { files } = await withGeneratedBundles(
+      { entry: ["x.ts"], format: ["esm", "cjs"], fixedExtension: true },
+      [bundle, bundle],
+    );
+    const ctsCount = files.filter((f) => f.path.endsWith("d.cts")).length;
+    expect(ctsCount).toBe(1);
+  });
+});
+
+describe("generateBundle - sourcemaps", () => {
+  it("emits a .map file when sourcemap option is on and map is an object", async () => {
+    const { files } = await withBundle(
+      { entry: ["x.ts"], sourcemap: true },
+      { "index.js": { code: "x", map: { version: 3, mappings: "" } } },
+    );
+    const map = files.find((f) => f.path.endsWith(".js.map"));
+    expect(map).toBeDefined();
+    expect(JSON.parse((map?.contents ?? Buffer.alloc(0)).toString())).toEqual({
+      version: 3,
+      mappings: "",
+    });
+  });
+
+  it("emits a .map file when map is already a string", async () => {
+    const { files } = await withBundle(
+      { entry: ["x.ts"], sourcemap: true },
+      { "index.js": { code: "x", map: '{"version":3}' } },
+    );
+    const map = files.find((f) => f.path.endsWith(".js.map"));
+    expect(map?.contents?.toString()).toBe('{"version":3}');
+  });
+
+  it("reads sourcemap flag from config when option omits it", async () => {
+    mockedLoadConfig.mockResolvedValue({ config: { sourcemap: true }, sources: [] });
+    const { files } = await withBundle(
+      { entry: ["x.ts"] },
+      {
+        "index.js": { code: "x", map: { version: 3 } },
+      },
+    );
+    expect(files.some((f) => f.path.endsWith(".js.map"))).toBe(true);
+  });
+
+  it("does not emit a .map file when sourcemap option is off", async () => {
+    const { files } = await withBundle(
+      { entry: ["x.ts"], sourcemap: false },
+      { "index.js": { code: "x", map: { version: 3 } } },
+    );
+    expect(files.some((f) => f.path.endsWith(".map"))).toBe(false);
+  });
+
+  it("does not emit a .map file when there is no map data", async () => {
+    const { files } = await withBundle(
+      { entry: ["x.ts"], sourcemap: true },
+      {
+        "index.js": { code: "x" },
+      },
+    );
+    expect(files.some((f) => f.path.endsWith(".map"))).toBe(false);
+  });
+
+  it("does not duplicate an already-emitted map file", async () => {
+    const bundle = { "index.js": { code: "x", map: { version: 3 } } };
+    const { files } = await withGeneratedBundles({ entry: ["x.ts"], sourcemap: true }, [
+      bundle,
+      bundle,
+    ]);
+    expect(files.filter((f) => f.path.endsWith(".map"))).toHaveLength(1);
+  });
+});
+
+describe("build failures", () => {
+  it("wraps a thrown Error from build() in a PluginError", async () => {
+    mockedBuild.mockRejectedValue(new Error("boom"));
+    const { error } = await run({ entry: ["x.ts"] });
+    expect(error).toBeInstanceOf(Error);
+    expect(error?.message).toMatch(/boom/);
+  });
+
+  it("wraps a non-Error throw from build() by stringifying it", async () => {
+    mockedBuild.mockRejectedValue("just a string failure");
+    const { error } = await run({ entry: ["x.ts"] });
+    expect(error).toBeInstanceOf(Error);
+    expect(error?.message).toMatch(/just a string failure/);
+  });
+
+  it("wraps a loadConfig failure the same way", async () => {
+    mockedLoadConfig.mockRejectedValue(new Error("config parse failed"));
+    const { error } = await run({ entry: ["x.ts"] });
+    expect(error?.message).toMatch(/config parse failed/);
+  });
+});
+
+// --- helpers that run the flush lifecycle and then drive generateBundle ----
+
+function withBundle(
+  pluginOptions: Parameters<typeof gulpTsdown>[0],
+  bundle: Bundle,
+): Promise<{ files: Vinyl[]; buildConfig?: Partial<UserConfig> }> {
+  return runWithGeneratedBundle(pluginOptions, bundle);
+}
+
+function withBundleRaw(
+  pluginOptions: Parameters<typeof gulpTsdown>[0],
+  bundle: Bundle,
+): Promise<{ files: Vinyl[]; buildConfig?: Partial<UserConfig> }> {
+  return runWithGeneratedBundle(pluginOptions, bundle);
+}
+
+function runWithGeneratedBundle(
+  pluginOptions: Parameters<typeof gulpTsdown>[0],
+  bundle: Bundle,
+): Promise<{ files: Vinyl[]; buildConfig?: Partial<UserConfig> }> {
+  return withGeneratedBundles(pluginOptions, [bundle]);
+}
+
+/**
+ * Runs the plugin, invoking `generateBundle` once per entry in `bundles` from
+ * inside the mocked `build()` - mirroring how tsdown may call it multiple
+ * times across build/dts passes within a single flush() lifecycle.
+ * `generateBundle` is an arrow function, so its `this` is always the real
+ * Transform instance; output is read from the real stream via `run()`.
+ */
+function withGeneratedBundles(
+  pluginOptions: Parameters<typeof gulpTsdown>[0],
+  bundles: Bundle[],
+): Promise<{ files: Vinyl[]; buildConfig?: Partial<UserConfig> }> {
+  mockedBuild.mockImplementation(async (config: Parameters<typeof build>[0]) => {
+    const plugin = findMemoryPlugin(config);
+
+    // undefined 전달 시 발생할 수 있는 매개변수 타입 오류 방지
+    for (const bundle of bundles) {
+      plugin.generateBundle(undefined, bundle);
+    }
+
+    // any를 쓰지 않고 실제 build 함수의 비동기 반환 타입에 맞게 빈 배열로 반환
+    return [] as Awaited<ReturnType<typeof build>>;
+  });
+
+  return run(pluginOptions).then(({ files, buildConfig, error }) => {
+    if (error) throw error;
+    return { files, buildConfig };
+  });
+}

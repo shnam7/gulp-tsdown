@@ -1,8 +1,5 @@
 # gulp-tsdown
 
-[![npm version](https://shields.io)](https://npmjs.com)
-[![license](https://shields.io)](https://github.com)
-
 Gulp plugin for compiling and bundling TypeScript using [tsdown](https://github.com).
 
 It runs entirely **in-memory** (`write: false`), passing the compiled chunks and source maps directly into the Gulp stream without modifying or deleting your existing local files or `outDir` contents.
@@ -21,10 +18,10 @@ npm install --save-dev gulp-tsdown tsdown streamx vinyl
 
 ```javascript
 import gulp from "gulp";
-import gulpTsdown from "gulp-tsdown";
+import tsdown from "gulp-tsdown";
 
 export const foo = () => {
-  const tsDownOptions = {
+  const tsdownOptions = {
     format: ["esm", "cjs"],
     dts: true, // Generate declaration files (.d.ts)
     sourcemap: true,
@@ -32,7 +29,7 @@ export const foo = () => {
   };
   gulp
     .src("./src/scripts/app.ts") // Pass entry files through gulp.src
-    .pipe(tsDownG(tsDownOptions)) // Automatically picks up tsdown.config.ts
+    .pipe(tsdown(tsdownOptions)) // Automatically picks up tsdown.config.ts
     .pipe(gulp.dest("./dist")); // Writes virtual bundles cleanly onto the disk
 };
 ```

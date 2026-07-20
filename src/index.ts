@@ -1,7 +1,8 @@
 import path from "node:path";
 import PluginError from "plugin-error";
 import { Transform } from "streamx";
-import { build, type InlineConfig, type UserConfig } from "tsdown";
+// IMPORT ONLY TYPES AT THE TOP LEVEL
+import type { InlineConfig, UserConfig } from "tsdown";
 import { loadConfig } from "unconfig";
 import Vinyl from "vinyl";
 
@@ -13,6 +14,7 @@ export default function gulpTsdown(options: GulpTsdownOptions = {}): Transform {
   const files: string[] = [];
 
   return new Transform({
+    // Collect file paths flowing through the Gulp stream.
     transform(file: Vinyl, cb: (err: Error | null, data?: Vinyl) => void): void {
       if (file.isNull()) {
         cb(null, file);
@@ -27,8 +29,10 @@ export default function gulpTsdown(options: GulpTsdownOptions = {}): Transform {
       cb(null);
     },
 
+    // Execute tsdown and push generated bundles into the Gulp stream.
     async flush(cb: (err: Error | null) => void): Promise<void> {
       try {
+        // Search for tsdown.config.* files from the project root directory.
         const { config: inlineConfig } = await loadConfig<InlineConfig>({
           cwd: process.cwd(),
           sources: [{ files: ["tsdown.config"], extensions: ["ts", "js", "mjs", "cjs"] }],
@@ -37,9 +41,8 @@ export default function gulpTsdown(options: GulpTsdownOptions = {}): Transform {
         const baseConfig: UserConfig = inlineConfig ?? {};
         const pluginOptions: GulpTsdownOptions = options ?? {};
 
-        const baseEntry = baseConfig.entry;
-        const optionEntry = pluginOptions.entry;
-        const resolvedEntry = optionEntry || baseEntry || (files.length > 0 ? files : undefined);
+        const resolvedEntry =
+          pluginOptions.entry || baseConfig.entry || (files.length > 0 ? files : undefined);
 
         if (!resolvedEntry || (Array.isArray(resolvedEntry) && resolvedEntry.length === 0)) {
           cb(
@@ -61,30 +64,71 @@ export default function gulpTsdown(options: GulpTsdownOptions = {}): Transform {
         const optionPlugins = Array.isArray(pluginOptions.plugins) ? pluginOptions.plugins : [];
         const existingPlugins = [...basePlugins, ...optionPlugins];
 
+        // Dedup registry, scoped to this flush call, since multiple build/dts passes can emit the same file.
+        const emittedFiles = new Set<string>();
+
+        // Determine whether a cjs declaration needs to be forked from the esm one.
+        const targetFormats = pluginOptions.format || baseConfig.format || ["esm"];
+        const formatsArray = Array.isArray(targetFormats) ? targetFormats : [targetFormats];
+        const isCjsTarget = formatsArray.includes("cjs");
+        const isFixedExtension = pluginOptions.fixedExtension ?? baseConfig.fixedExtension ?? false;
+
         const memoryOutputPlugin = {
           name: "gulp-tsdown-memory-interceptor",
           generateBundle: (_outputOptions: unknown, bundle: Record<string, unknown>) => {
             for (const fileName of Object.keys(bundle)) {
               const fileAsset = bundle[fileName] as Record<string, unknown> | undefined;
+              if (!fileAsset) continue;
 
-              if (fileAsset && (fileAsset.type === "chunk" || typeof fileAsset.code === "string")) {
-                const codeContent = fileAsset.code;
+              // tsdown wraps declaration output under 'source', and js/asset output under 'code'.
+              const content =
+                typeof fileAsset.code === "string"
+                  ? fileAsset.code
+                  : typeof fileAsset.source === "string"
+                    ? fileAsset.source
+                    : undefined;
 
-                // Push compiled main JS codes into the Gulp stream
-                if (typeof codeContent === "string") {
+              if (typeof content === "string") {
+                // [A] Emit the file tsdown produced as-is (.js, .cjs, .mjs, .d.ts, .d.mts, ...).
+                if (!emittedFiles.has(fileName)) {
                   this.push(
                     new Vinyl({
                       cwd: process.cwd(),
                       base: resolvedOutDir,
                       path: path.resolve(resolvedOutDir, fileName),
-                      contents: Buffer.from(codeContent, "utf-8"),
+                      contents: Buffer.from(content, "utf-8"),
                     }),
                   );
+                  emittedFiles.add(fileName);
                 }
 
-                // Intercept and parse the internal sourcemap data.
-                // In 'write: false' mode, Rolldown keeps sourcemaps attached inside the asset metadata
-                // instead of outputting separate keys. This ensures they are safely captured and streamed.
+                // [B] Fork a .d.cts declaration from the esm declaration, in memory.
+                // With fixedExtension enabled, tsdown emits the esm declaration as '.d.mts'
+                // (not '.d.ts'), so both suffixes need to be matched here.
+                const dtsMatch = fileName.match(/\.d\.m?ts$/);
+                if (dtsMatch && isCjsTarget && isFixedExtension) {
+                  const cjsDtsName = fileName.replace(/\.d\.m?ts$/, ".d.cts");
+
+                  if (!emittedFiles.has(cjsDtsName)) {
+                    // Rewrite relative import/export specifiers from .js/.mjs to .cjs
+                    // so the forked declaration file resolves correctly under cjs.
+                    const transformedContent = content
+                      .replace(/(from\s+["']\.\.?\/[^"'\n]+)\.(js|mjs)(["'])/g, "$1.cjs$3")
+                      .replace(/(import\s+["']\.\.?\/[^"'\n]+)\.(js|mjs)(["'])/g, "$1.cjs$3");
+
+                    this.push(
+                      new Vinyl({
+                        cwd: process.cwd(),
+                        base: resolvedOutDir,
+                        path: path.resolve(resolvedOutDir, cjsDtsName),
+                        contents: Buffer.from(transformedContent, "utf-8"),
+                      }),
+                    );
+                    emittedFiles.add(cjsDtsName);
+                  }
+                }
+
+                // [C] Emit the sourcemap alongside its file (e.g. .cjs -> .cjs.map), deduped.
                 const hasSourcemap = pluginOptions.sourcemap ?? baseConfig.sourcemap;
                 if (hasSourcemap && fileAsset.map) {
                   const mapData =
@@ -93,14 +137,19 @@ export default function gulpTsdown(options: GulpTsdownOptions = {}): Transform {
                       : fileAsset.map;
 
                   if (typeof mapData === "string") {
-                    this.push(
-                      new Vinyl({
-                        cwd: process.cwd(),
-                        base: resolvedOutDir,
-                        path: path.resolve(resolvedOutDir, `${fileName}.map`), // 기존 파일명 뒤에 .map 결합
-                        contents: Buffer.from(mapData, "utf-8"),
-                      }),
-                    );
+                    const mapFileName = `${fileName}.map`;
+
+                    if (!emittedFiles.has(mapFileName)) {
+                      this.push(
+                        new Vinyl({
+                          cwd: process.cwd(),
+                          base: resolvedOutDir,
+                          path: path.resolve(resolvedOutDir, mapFileName),
+                          contents: Buffer.from(mapData, "utf-8"),
+                        }),
+                      );
+                      emittedFiles.add(mapFileName);
+                    }
                   }
                 }
               }
@@ -108,16 +157,40 @@ export default function gulpTsdown(options: GulpTsdownOptions = {}): Transform {
           },
         };
 
+        // tsdown may run a separate build pass for dts output; inject the same
+        // interceptor there so it also catches the declaration output (.d.ts/.d.mts).
+        const dtsConfig =
+          typeof baseConfig.dts === "object"
+            ? baseConfig.dts
+            : typeof pluginOptions.dts === "object"
+              ? pluginOptions.dts
+              : {};
+
+        const existingDtsPlugins = Array.isArray((dtsConfig as Record<string, unknown>).plugins)
+          ? ((dtsConfig as Record<string, unknown>).plugins as unknown[])
+          : [];
+
         const finalConfig = {
           ...baseConfig,
           ...pluginOptions,
           entry: resolvedEntry,
-          write: false,
+          write: false, // Keep everything in memory; nothing is written to disk by tsdown itself.
           clean: false,
           plugins: [...existingPlugins, memoryOutputPlugin],
+          dts:
+            pluginOptions.dts || baseConfig.dts
+              ? {
+                  ...(typeof baseConfig.dts === "object" ? baseConfig.dts : {}),
+                  ...(typeof pluginOptions.dts === "object" ? pluginOptions.dts : {}),
+                  plugins: [...existingDtsPlugins, memoryOutputPlugin],
+                }
+              : undefined,
         };
 
+        // DEFERRED RUNTIME IMPORT FOR THE BUILD FUNCTION
+        const { build } = await import("tsdown");
         await build(finalConfig as InlineConfig);
+
         cb(null);
       } catch (err) {
         const errorObject = err instanceof Error ? err : new Error(String(err));
