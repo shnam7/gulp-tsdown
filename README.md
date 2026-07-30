@@ -55,6 +55,54 @@ export default defineConfig({
 });
 ```
 
+### Using with [`gulp-tron`](https://github.com/shnam7/gulp-tron)
+
+Excerpt from [gulp-tron example #15](https://github.com/shnam7/gulp-tron/blob/main/examples/15-twig/gulpfile.js)
+
+```js
+import gulp from "gulp";
+import tsdownG from "gulp-tsdown";
+
+const scripts = {
+  name: "scripts",
+
+  build(bs) {
+    bs.src()
+      .debug("src:")
+      //--- Using gulp-tsdown
+      .pipe(
+        tsdownG({
+          format: ["cjs", "esm"],
+          dts: true,
+          sourcemap: true,
+          fixedExtension: true,
+        }),
+      )
+      .debug("tsdown");
+
+    // create dts-file-only stream if necessary
+    const dts = bs.clone().filter(["*.d.mts", "*.d.cts"]);
+    dts.debug("dts:");
+
+    // create map-file-only stream if necessary
+    const map = bs.clone().filter("*.map");
+    map.debug("map:");
+
+    // create mts and cjs file only stream if necessary
+    const js = bs.clone().filter(["!*.d.ts", "*.mts", "*.cjs"]);
+    js.debug("ts:");
+
+    // bs still has all the files.
+    bs.dest();
+  },
+
+  src: path.join(srcRoot, "scripts/**/app.ts"),
+  dest: path.join(destRoot, "js"),
+};
+
+tron.task(scripts);
+```
+
 ## API
 
 ### gulpTsdown(options?)
@@ -78,7 +126,7 @@ gulp
   .pipe(gulp.dest("./custom-build-folder"));
 ```
 
-## Important Notes
+## Notes
 
 - **Streaming Not Supported**: Gulp's streaming mode (`gulp.src('...', { buffer: false })`) is not supported. Ensure files are passed as buffers (default Gulp behavior).
 - **Null Files Passed Safe**: Directory structures and empty null files flowing down the stream are safely passed through without interrupting the compilation pipeline.
