@@ -26,7 +26,7 @@ export default function gulpTsdown(options: GulpTsdownOptions = {}): Transform {
       }
 
       files.push(file.path);
-      cb(null);
+      cb(null, file);
     },
 
     // Execute tsdown and push generated bundles into the Gulp stream.
@@ -60,8 +60,16 @@ export default function gulpTsdown(options: GulpTsdownOptions = {}): Transform {
         const targetOutDir = optionOutDir || baseOutDir || "dist";
         const resolvedOutDir = path.resolve(process.cwd(), targetOutDir);
 
-        const basePlugins = Array.isArray(baseConfig.plugins) ? baseConfig.plugins : [];
-        const optionPlugins = Array.isArray(pluginOptions.plugins) ? pluginOptions.plugins : [];
+        const basePlugins = baseConfig.plugins
+          ? Array.isArray(baseConfig.plugins)
+            ? baseConfig.plugins
+            : [baseConfig.plugins]
+          : [];
+        const optionPlugins = pluginOptions.plugins
+          ? Array.isArray(pluginOptions.plugins)
+            ? pluginOptions.plugins
+            : [pluginOptions.plugins]
+          : [];
         const existingPlugins = [...basePlugins, ...optionPlugins];
 
         // Dedup registry, scoped to this flush call, since multiple build/dts passes can emit the same file.
@@ -81,14 +89,14 @@ export default function gulpTsdown(options: GulpTsdownOptions = {}): Transform {
               if (!fileAsset) continue;
 
               // tsdown wraps declaration output under 'source', and js/asset output under 'code'.
-              const content =
+              const content: string | Uint8Array | undefined =
                 typeof fileAsset.code === "string"
                   ? fileAsset.code
-                  : typeof fileAsset.source === "string"
+                  : typeof fileAsset.source === "string" || fileAsset.source instanceof Uint8Array
                     ? fileAsset.source
                     : undefined;
 
-              if (typeof content === "string") {
+              if (content !== undefined) {
                 // [A] Emit the file tsdown produced as-is (.js, .cjs, .mjs, .d.ts, .d.mts, ...).
                 if (!emittedFiles.has(fileName)) {
                   this.push(
@@ -96,7 +104,7 @@ export default function gulpTsdown(options: GulpTsdownOptions = {}): Transform {
                       cwd: process.cwd(),
                       base: resolvedOutDir,
                       path: path.resolve(resolvedOutDir, fileName),
-                      contents: Buffer.from(content, "utf-8"),
+                      contents: Buffer.from(content),
                     }),
                   );
                   emittedFiles.add(fileName);
@@ -106,7 +114,7 @@ export default function gulpTsdown(options: GulpTsdownOptions = {}): Transform {
                 // With fixedExtension enabled, tsdown emits the esm declaration as '.d.mts'
                 // (not '.d.ts'), so both suffixes need to be matched here.
                 const dtsMatch = fileName.match(/\.d\.m?ts$/);
-                if (dtsMatch && isCjsTarget && isFixedExtension) {
+                if (typeof content === "string" && dtsMatch && isCjsTarget && isFixedExtension) {
                   const cjsDtsName = fileName.replace(/\.d\.m?ts$/, ".d.cts");
 
                   if (!emittedFiles.has(cjsDtsName)) {
@@ -129,7 +137,10 @@ export default function gulpTsdown(options: GulpTsdownOptions = {}): Transform {
                 }
 
                 // [C] Emit the sourcemap alongside its file (e.g. .cjs -> .cjs.map), deduped.
-                const hasSourcemap = pluginOptions.sourcemap ?? baseConfig.sourcemap;
+                const dtsSourcemap =
+                  typeof dtsConfig === "object" ? dtsConfig.sourcemap : undefined;
+                const hasSourcemap =
+                  pluginOptions.sourcemap ?? baseConfig.sourcemap ?? dtsSourcemap;
                 if (hasSourcemap && fileAsset.map) {
                   const mapData =
                     typeof fileAsset.map === "object"
@@ -159,16 +170,37 @@ export default function gulpTsdown(options: GulpTsdownOptions = {}): Transform {
 
         // tsdown may run a separate build pass for dts output; inject the same
         // interceptor there so it also catches the declaration output (.d.ts/.d.mts).
-        const dtsConfig =
-          typeof baseConfig.dts === "object"
-            ? baseConfig.dts
-            : typeof pluginOptions.dts === "object"
-              ? pluginOptions.dts
-              : {};
+        const dtsConfig = pluginOptions.dts ?? baseConfig.dts;
 
-        const existingDtsPlugins = Array.isArray((dtsConfig as Record<string, unknown>).plugins)
-          ? ((dtsConfig as Record<string, unknown>).plugins as unknown[])
-          : [];
+        const getDtsPlugins = (value: unknown): unknown => {
+          if (value && typeof value === "object" && "plugins" in value) {
+            return (value as Record<string, unknown>).plugins;
+          }
+          return undefined;
+        };
+        const baseDtsPlugins = getDtsPlugins(baseConfig.dts);
+        const optionDtsPlugins = getDtsPlugins(pluginOptions.dts);
+        const existingDtsPlugins = [
+          ...(baseDtsPlugins
+            ? Array.isArray(baseDtsPlugins)
+              ? baseDtsPlugins
+              : [baseDtsPlugins]
+            : []),
+          ...(optionDtsPlugins
+            ? Array.isArray(optionDtsPlugins)
+              ? optionDtsPlugins
+              : [optionDtsPlugins]
+            : []),
+        ];
+
+        const finalDts =
+          dtsConfig === undefined || dtsConfig === false
+            ? dtsConfig
+            : {
+                ...(typeof baseConfig.dts === "object" ? baseConfig.dts : {}),
+                ...(typeof pluginOptions.dts === "object" ? pluginOptions.dts : {}),
+                plugins: [...existingDtsPlugins, memoryOutputPlugin],
+              };
 
         const finalConfig = {
           ...baseConfig,
@@ -177,14 +209,7 @@ export default function gulpTsdown(options: GulpTsdownOptions = {}): Transform {
           write: false, // Keep everything in memory; nothing is written to disk by tsdown itself.
           clean: false,
           plugins: [...existingPlugins, memoryOutputPlugin],
-          dts:
-            pluginOptions.dts || baseConfig.dts
-              ? {
-                  ...(typeof baseConfig.dts === "object" ? baseConfig.dts : {}),
-                  ...(typeof pluginOptions.dts === "object" ? pluginOptions.dts : {}),
-                  plugins: [...existingDtsPlugins, memoryOutputPlugin],
-                }
-              : undefined,
+          dts: finalDts,
         };
 
         // DEFERRED RUNTIME IMPORT FOR THE BUILD FUNCTION

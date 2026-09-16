@@ -129,7 +129,7 @@ gulp
 ## Notes
 
 - **Streaming Not Supported**: Gulp's streaming mode (`gulp.src('...', { buffer: false })`) is not supported. Ensure files are passed as buffers (default Gulp behavior).
-- **Null Files Passed Safe**: Directory structures and empty null files flowing down the stream are safely passed through without interrupting the compilation pipeline.
+- **Input Files Passed Through**: Buffer and null files flowing down the stream are passed through while buffer file paths are also used as default entry points. Streaming files are rejected.
 
 ## License
 

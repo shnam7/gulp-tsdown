@@ -18,7 +18,20 @@ import gulpTsdown from "../src/index";
 const mockedLoadConfig = vi.mocked(loadConfig);
 const mockedBuild = vi.mocked(build);
 
-type Bundle = Record<string, { code?: string; source?: string; map?: unknown } | undefined>;
+type Bundle = Record<
+  string,
+  { code?: string; source?: string | Uint8Array; map?: unknown } | undefined
+>;
+
+function createBuildHandle(): Awaited<ReturnType<typeof build>> {
+  return {
+    bundles: [],
+    watch: {
+      restart: async () => createBuildHandle(),
+      close: async () => {},
+    },
+  };
+}
 
 // function getBuildConfig(index = 0): Partial<UserConfig> {
 //   return (mockedBuild.mock.calls[index]?.[0] as Partial<UserConfig>) || {};
@@ -100,7 +113,7 @@ function vinylFile(filePath: string, contents: string | null = ""): Vinyl {
 beforeEach(() => {
   vi.clearAllMocks();
   mockedLoadConfig.mockResolvedValue({ config: {}, sources: [] });
-  mockedBuild.mockResolvedValue([]);
+  mockedBuild.mockResolvedValue(createBuildHandle());
 });
 
 describe("transform", () => {
@@ -125,8 +138,9 @@ describe("transform", () => {
 
   it("collects buffer file paths to use as entry when no entry is configured", async () => {
     const file = vinylFile("/proj/src/one.ts", "export {}");
-    await run({}, [file]);
+    const { files } = await run({}, [file]);
     expect(mockedBuild).toHaveBeenCalledTimes(1);
+    expect(files).toContain(file);
 
     const configArg = mockedBuild.mock.calls[0]?.[0] as Partial<UserConfig> | undefined;
     expect(configArg?.entry).toEqual(["/proj/src/one.ts"]);
@@ -232,6 +246,21 @@ describe("plugins merging", () => {
 
     expect(pluginName).toBe("gulp-tsdown-memory-interceptor");
   });
+
+  it("preserves single config and option plugins", async () => {
+    const configPlugin = { name: "config-plugin" };
+    const optionPlugin = { name: "option-plugin" };
+    mockedLoadConfig.mockResolvedValue({ config: { plugins: configPlugin }, sources: [] });
+    await run({ entry: ["x.ts"], plugins: optionPlugin });
+
+    const configArg = mockedBuild.mock.calls[0]?.[0] as Partial<UserConfig> | undefined;
+    const plugins = Array.isArray(configArg?.plugins) ? configArg.plugins : [];
+    expect(plugins.map((plugin) => (plugin && "name" in plugin ? plugin.name : ""))).toEqual([
+      "config-plugin",
+      "option-plugin",
+      "gulp-tsdown-memory-interceptor",
+    ]);
+  });
 });
 
 describe("dts config merging", () => {
@@ -260,11 +289,18 @@ describe("dts config merging", () => {
   });
 
   it("merges config-level dts object with option-level dts object", async () => {
+    const existingDtsPlugin = { name: "existing-dts-plugin" };
     mockedLoadConfig.mockResolvedValue({
-      config: { dts: { resolve: true } },
+      config: { dts: { resolve: true, plugins: [existingDtsPlugin] } },
       sources: [],
     });
-    await run({ entry: ["x.ts"], dts: { sourcemap: true } });
+    await run({
+      entry: ["x.ts"],
+      dts: {
+        sourcemap: true,
+        plugins: [{ name: "option-dts-plugin" }],
+      } as UserConfig["dts"] & { plugins: unknown[] },
+    } as Partial<UserConfig>);
 
     const configArg = mockedBuild.mock.calls[0]?.[0];
     const rawDts =
@@ -277,6 +313,8 @@ describe("dts config merging", () => {
     expect(dts.resolve).toBe(true);
     expect(dts.sourcemap).toBe(true);
     expect(dts.plugins).toEqual([
+      existingDtsPlugin,
+      { name: "option-dts-plugin" },
       expect.objectContaining({ name: "gulp-tsdown-memory-interceptor" }),
     ]);
   });
@@ -290,6 +328,13 @@ describe("dts config merging", () => {
     expect(dtsPlugins).toEqual([
       expect.objectContaining({ name: "gulp-tsdown-memory-interceptor" }),
     ]);
+  });
+
+  it("allows option-level dts false to disable config-level dts", async () => {
+    mockedLoadConfig.mockResolvedValue({ config: { dts: true }, sources: [] });
+    await run({ entry: ["x.ts"], dts: false });
+    const configArg = mockedBuild.mock.calls[0]?.[0] as Partial<UserConfig> | undefined;
+    expect(configArg?.dts).toBe(false);
   });
 });
 
@@ -315,6 +360,12 @@ describe("generateBundle - standard output", () => {
     );
     expect(files).toHaveLength(1);
     expect(files[0]?.contents?.toString()).toBe("export declare const x: number;");
+  });
+
+  it("emits binary asset sources without changing their bytes", async () => {
+    const source = new Uint8Array([0, 1, 255]);
+    const { files } = await withBundle({ entry: ["x.ts"] }, { "asset.bin": { source } });
+    expect(files[0]?.contents).toEqual(Buffer.from(source));
   });
 
   it("skips bundle entries with neither `code` nor `source`", async () => {
@@ -460,6 +511,14 @@ describe("generateBundle - sourcemaps", () => {
     expect(files.some((f) => f.path.endsWith(".js.map"))).toBe(true);
   });
 
+  it("reads sourcemap flag from the DTS config", async () => {
+    const { files } = await withBundle(
+      { entry: ["x.ts"], dts: { sourcemap: true } },
+      { "index.d.ts": { source: "export declare const x: number;", map: { version: 3 } } },
+    );
+    expect(files.some((f) => f.path.endsWith(".d.ts.map"))).toBe(true);
+  });
+
   it("does not emit a .map file when sourcemap option is off", async () => {
     const { files } = await withBundle(
       { entry: ["x.ts"], sourcemap: false },
@@ -552,8 +611,7 @@ function withGeneratedBundles(
       plugin.generateBundle(undefined, bundle);
     }
 
-    // any를 쓰지 않고 실제 build 함수의 비동기 반환 타입에 맞게 빈 배열로 반환
-    return [] as Awaited<ReturnType<typeof build>>;
+    return createBuildHandle();
   });
 
   return run(pluginOptions).then(({ files, buildConfig, error }) => {
