@@ -1,7 +1,6 @@
 import path from "node:path";
 import PluginError from "plugin-error";
 import { Transform } from "streamx";
-// IMPORT ONLY TYPES AT THE TOP LEVEL
 import type { InlineConfig, UserConfig } from "tsdown";
 import { loadConfig } from "unconfig";
 import Vinyl from "vinyl";
@@ -212,7 +211,7 @@ export default function gulpTsdown(options: GulpTsdownOptions = {}): Transform {
           dts: finalDts,
         };
 
-        // DEFERRED RUNTIME IMPORT FOR THE BUILD FUNCTION
+        // deferred runtime import for the build function
         const { build } = await import("tsdown");
         await build(finalConfig as InlineConfig);
 

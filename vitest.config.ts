@@ -1,3 +1,4 @@
+import type { UserConfig } from "tsdown";
 import { defineConfig } from "vitest/config";
 
 export default defineConfig({
@@ -15,4 +16,4 @@ export default defineConfig({
       },
     },
   },
-});
+}) as UserConfig;
